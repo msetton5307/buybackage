@@ -234,20 +234,17 @@
     </footer>
 
     <script type="module">
-        // Firebase SDK Imports
+        // Firebase SDK Imports (Auth only)
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         document.addEventListener('DOMContentLoaded', function() {
             // --- Firebase Initialization and Authentication ---
             const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
             const app = initializeApp(firebaseConfig);
             const auth = getAuth(app);
-            const db = getFirestore(app);
 
             let currentUserId = null; // Will be set if user is logged in
-            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
             // Login Redirection Logic
             onAuthStateChanged(auth, (user) => {
@@ -510,17 +507,23 @@
                 };
 
                 try {
-                    // Save to Firestore
-                    // Collection path: artifacts/{appId}/users/{userId}/orders/{orderId}
-                    const orderDocRef = doc(db, `artifacts/${appId}/users/${currentUserId}/orders`, orderId);
-                    await setDoc(orderDocRef, orderData);
+                    const response = await fetch('/submit-order', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(orderData)
+                    });
+
+                    if (!response.ok) {
+                        const errText = await response.text();
+                        throw new Error(errText || 'Failed to submit order');
+                    }
 
                     showFormMessage('Success! Your order has been confirmed and saved. A shipping kit will be sent to your email shortly.', 'success');
                     finalConfirmBtn.disabled = true; // Prevent multiple submissions
                     termsCheck.disabled = true;
 
                 } catch (error) {
-                    console.error("Error saving order to Firestore:", error);
+                    console.error("Error saving order:", error);
                     showFormMessage(`Error confirming order: ${error.message}. Please try again.`, 'error');
                 }
             });
