@@ -1,8 +1,9 @@
 const functions = require("firebase-functions");
 const express = require("express");
 const cors = require("cors");
-const admin = require("firebase-admin");
 const axios = require("axios");
+const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -19,10 +20,21 @@ app.use(
 );
 app.use(express.json());
 
-// Initialize Firebase Admin SDK
-admin.initializeApp();
-const db = admin.firestore();
-const ordersCollection = db.collection("orders");
+// Initialize PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: functions.config().postgres.url,
+});
+
+function mapOrderRow(row) {
+  return {
+    id: row.id,
+    ...(row.data || {}),
+    status: row.status,
+    reofferDetails: row.reoffer_details,
+    uspsLabelUrl: row.usps_label_url,
+    zendeskTicketId: row.zendesk_ticket_id,
+  };
+}
 
 // ------------------------------
 // Zendesk Configuration
@@ -158,10 +170,11 @@ async function sendBuyerReofferEmailViaZendesk(orderId, buyerEmail, orderDetails
       }
     );
     console.log(`Re-offer email sent via Zendesk to ${buyerEmail} for Order #${orderId} (Ticket ID: ${response.data.ticket.id})`);
-    // Store the Zendesk Ticket ID in the Firestore order document
-    await ordersCollection.doc(orderId).update({
-      zendeskTicketId: response.data.ticket.id
-    });
+    // Store the Zendesk Ticket ID in the order record
+    await pool.query(
+      "UPDATE orders SET zendesk_ticket_id=$1 WHERE id=$2",
+      [response.data.ticket.id, orderId]
+    );
     return response.data;
   } catch (err) {
     console.error(`Failed to send re-offer email via Zendesk to ${buyerEmail} for Order #${orderId}:`, err.response?.data || err);
@@ -205,11 +218,11 @@ async function sendCustomEmailViaZendesk(orderId, buyerEmail, buyerName, subject
       }
     );
     console.log(`Custom email sent via Zendesk to ${buyerEmail} for Order #${orderId} (Ticket ID: ${response.data.ticket.id})`);
-    // Store the Zendesk Ticket ID in the Firestore order document if it's a new ticket
-    // This assumes custom emails might also initiate a new ticket for a conversation thread
-    await ordersCollection.doc(orderId).update({
-      zendeskTicketId: response.data.ticket.id // Store the new ticket ID
-    }, { merge: true }); // Use merge to avoid overwriting other fields
+    // Store the Zendesk Ticket ID in the order record
+    await pool.query(
+      "UPDATE orders SET zendesk_ticket_id=$1 WHERE id=$2",
+      [response.data.ticket.id, orderId]
+    );
     return response.data;
   } catch (err) {
     console.error(`Failed to send custom email via Zendesk to ${buyerEmail} for Order #${orderId}:`, err.response?.data || err);
@@ -319,8 +332,10 @@ async function createShipmentAndLabel(orderId, orderDetails) {
 // GET all orders
 app.get("/orders", async (req, res) => {
   try {
-    const snapshot = await ordersCollection.get();
-    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const { rows } = await pool.query(
+      "SELECT id, data, status, reoffer_details, usps_label_url, zendesk_ticket_id FROM orders"
+    );
+    const orders = rows.map(mapOrderRow);
     res.json(orders);
   } catch (err) {
     console.error("Error fetching orders:", err);
@@ -331,12 +346,14 @@ app.get("/orders", async (req, res) => {
 // GET a single order by ID
 app.get("/orders/:id", async (req, res) => {
   try {
-    const docRef = ordersCollection.doc(req.params.id);
-    const doc = await docRef.get();
-    if (!doc.exists) {
+    const { rows } = await pool.query(
+      "SELECT id, data, status, reoffer_details, usps_label_url, zendesk_ticket_id FROM orders WHERE id=$1",
+      [req.params.id]
+    );
+    if (rows.length === 0) {
       return res.status(404).json({ error: "Order not found" });
     }
-    res.json({ id: doc.id, ...doc.data() });
+    res.json(mapOrderRow(rows[0]));
   } catch (err) {
     console.error("Error fetching single order:", err);
     res.status(500).json({ error: "Failed to fetch order" });
@@ -351,13 +368,13 @@ app.post("/submit-order", async (req, res) => {
       return res.status(400).json({ error: "Invalid order data: missing shippingInfo or estimatedQuote" });
     }
 
-    const docRef = await ordersCollection.add({
-      ...orderData,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      status: "pending_shipment"
-    });
+    const orderId = orderData.orderId || crypto.randomUUID();
+    await pool.query(
+      "INSERT INTO orders (id, data, status, created_at) VALUES ($1, $2::jsonb, $3, NOW())",
+      [orderId, orderData, "pending_shipment"]
+    );
 
-    res.status(201).json({ message: "Order submitted", orderId: docRef.id });
+    res.status(201).json({ message: "Order submitted", orderId });
   } catch (err) {
     console.error("Error submitting order:", err);
     res.status(500).json({ error: "Failed to submit order" });
@@ -372,21 +389,23 @@ app.put("/orders/:id/reoffer", async (req, res) => {
       return res.status(400).json({ error: "New price and reason are required" });
     }
 
-    const docRef = ordersCollection.doc(req.params.id);
-    const doc = await docRef.get();
-    if (!doc.exists) return res.status(404).json({ error: "Order not found" });
-    const orderData = doc.data();
+    const { rows } = await pool.query(
+      "SELECT data FROM orders WHERE id=$1",
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    const orderData = rows[0].data;
 
     const reofferDetails = {
       newPrice: parseFloat(newPrice),
       reason: reason,
-      reofferedAt: admin.firestore.FieldValue.serverTimestamp(),
+      reofferedAt: new Date().toISOString(),
     };
 
-    await docRef.update({
-      status: "re-offered",
-      reofferDetails: reofferDetails
-    });
+    await pool.query(
+      "UPDATE orders SET status=$1, reoffer_details=$2 WHERE id=$3",
+      ["re-offered", reofferDetails, req.params.id]
+    );
 
     // Create an internal Zendesk ticket for admin notification (now as a private note)
     await createZendeskInternalTicket(req.params.id, reofferDetails.newPrice, reofferDetails.reason);
@@ -409,17 +428,19 @@ app.put("/orders/:id/reoffer", async (req, res) => {
 // POST to generate a shipping label for an order
 app.post("/generate-label/:id", async (req, res) => {
   try {
-    const docRef = ordersCollection.doc(req.params.id);
-    const doc = await docRef.get();
-    if (!doc.exists) return res.status(404).json({ error: "Order not found" });
-    const order = { id: doc.id, ...doc.data() };
+    const { rows } = await pool.query(
+      "SELECT id, data FROM orders WHERE id=$1",
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    const order = { id: rows[0].id, ...rows[0].data };
 
     const uspsLabelUrl = await createShipmentAndLabel(order.id, order);
 
-    await docRef.update({
-      status: "label_generated",
-      uspsLabelUrl: uspsLabelUrl,
-    });
+    await pool.query(
+      "UPDATE orders SET status=$1, usps_label_url=$2 WHERE id=$3",
+      ["label_generated", uspsLabelUrl, req.params.id]
+    );
 
     res.status(200).json({ message: "Label generated successfully.", uspsLabelUrl });
   } catch (err) {
@@ -436,14 +457,16 @@ app.post("/orders/:id/send-custom-email", async (req, res) => {
       return res.status(400).json({ error: "Email subject and body are required." });
     }
 
-    const docRef = ordersCollection.doc(req.params.id);
-    const doc = await docRef.get();
-    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
-    const orderData = doc.data();
+    const { rows } = await pool.query(
+      "SELECT data, zendesk_ticket_id FROM orders WHERE id=$1",
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Order not found." });
+    const orderData = rows[0].data;
 
     const buyerEmail = orderData.shippingInfo.email;
     const buyerName = orderData.shippingInfo.fullName;
-    const zendeskTicketId = orderData.zendeskTicketId; // Get existing ticket ID
+    const zendeskTicketId = rows[0].zendesk_ticket_id; // Get existing ticket ID
 
     if (buyerEmail) {
       if (zendeskTicketId) {
@@ -475,15 +498,17 @@ app.post("/orders/:id/add-buyer-reply", async (req, res) => {
   }
 
   try {
-    const docRef = ordersCollection.doc(orderId);
-    const doc = await docRef.get();
+    const { rows } = await pool.query(
+      "SELECT data, zendesk_ticket_id FROM orders WHERE id=$1",
+      [orderId]
+    );
 
-    if (!doc.exists) {
+    if (rows.length === 0) {
       return res.status(404).send("Error: Order not found.");
     }
 
-    const orderData = doc.data();
-    const zendeskTicketId = orderData.zendeskTicketId;
+    const orderData = rows[0].data;
+    const zendeskTicketId = rows[0].zendesk_ticket_id;
     const buyerEmail = orderData.shippingInfo?.email || 'unknown@example.com';
     const buyerName = orderData.shippingInfo?.fullName || 'Customer';
 
@@ -527,13 +552,11 @@ app.put("/orders/:id/status", async (req, res) => {
     const { status } = req.body;
     if (!status) return res.status(400).json({ error: "Status is required." });
 
-    const docRef = ordersCollection.doc(req.params.id);
-    const doc = await docRef.get();
-    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
-
-    await docRef.update({
-      status: status
-    });
+    const result = await pool.query(
+      "UPDATE orders SET status=$1 WHERE id=$2",
+      [status, req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Order not found." });
 
     res.status(200).json({ message: `Order status updated to "${status}".` });
   } catch (err) {
@@ -556,24 +579,27 @@ app.get("/accept-offer", async (req, res) => {
   }
 
   try {
-    const docRef = ordersCollection.doc(orderId);
-    const doc = await docRef.get();
+    const { rows } = await pool.query(
+      "SELECT data, reoffer_details, zendesk_ticket_id FROM orders WHERE id=$1",
+      [orderId]
+    );
 
-    if (!doc.exists) {
+    if (rows.length === 0) {
       return res.status(404).send("Error: Order not found.");
     }
 
-    const orderData = doc.data();
-    const newPrice = orderData.reofferDetails?.newPrice || orderData.estimatedQuote;
-    const reason = orderData.reofferDetails?.reason || 'N/A';
+    const orderData = rows[0].data;
+    const reofferDetails = rows[0].reoffer_details || {};
+    const newPrice = reofferDetails.newPrice || orderData.estimatedQuote;
+    const reason = reofferDetails.reason || 'N/A';
     const buyerName = orderData.shippingInfo?.fullName || 'Customer';
-    const buyerEmail = orderData.shippingInfo?.email || 'unknown@example.com'; // Added buyerEmail
-    const zendeskTicketId = orderData.zendeskTicketId;
+    const buyerEmail = orderData.shippingInfo?.email || 'unknown@example.com';
+    const zendeskTicketId = rows[0].zendesk_ticket_id;
 
-    await docRef.update({
-      status: "offer_accepted",
-      acceptedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    await pool.query(
+      "UPDATE orders SET status=$1 WHERE id=$2",
+      ["offer_accepted", orderId]
+    );
 
     if (zendeskTicketId) {
       await addCommentToZendeskTicket(zendeskTicketId, `Buyer (${buyerName}) has accepted the new offer of $${newPrice.toFixed(2)} for Order #${orderId}. Reason for re-offer: "${reason}".`, buyerEmail, buyerName);
@@ -612,24 +638,27 @@ app.get("/return-phone", async (req, res) => {
   }
 
   try {
-    const docRef = ordersCollection.doc(orderId);
-    const doc = await docRef.get();
+    const { rows } = await pool.query(
+      "SELECT data, reoffer_details, zendesk_ticket_id FROM orders WHERE id=$1",
+      [orderId]
+    );
 
-    if (!doc.exists) {
+    if (rows.length === 0) {
       return res.status(404).send("Error: Order not found.");
     }
 
-    const orderData = doc.data();
-    const newPrice = orderData.reofferDetails?.newPrice || orderData.estimatedQuote;
-    const reason = orderData.reofferDetails?.reason || 'N/A';
+    const orderData = rows[0].data;
+    const reofferDetails = rows[0].reoffer_details || {};
+    const newPrice = reofferDetails.newPrice || orderData.estimatedQuote;
+    const reason = reofferDetails.reason || 'N/A';
     const buyerName = orderData.shippingInfo?.fullName || 'Customer';
-    const buyerEmail = orderData.shippingInfo?.email || 'unknown@example.com'; // Added buyerEmail
-    const zendeskTicketId = orderData.zendeskTicketId;
+    const buyerEmail = orderData.shippingInfo?.email || 'unknown@example.com';
+    const zendeskTicketId = rows[0].zendesk_ticket_id;
 
-    await docRef.update({
-      status: "return_requested",
-      returnRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    await pool.query(
+      "UPDATE orders SET status=$1 WHERE id=$2",
+      ["return_requested", orderId]
+    );
 
     if (zendeskTicketId) {
       await addCommentToZendeskTicket(zendeskTicketId, `Buyer (${buyerName}) has declined the new offer of $${newPrice.toFixed(2)} and requested phone return for Order #${orderId}. Reason for re-offer: "${reason}".`, buyerEmail, buyerName);
